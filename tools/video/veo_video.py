@@ -281,19 +281,21 @@ class VeoVideo(BaseTool):
 
         from tools.video._shared import submit_and_poll_fal_queue
 
+        output_path = Path(inputs.get("output_path", "veo_output.mp4"))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
         try:
             data = submit_and_poll_fal_queue(
                 f"https://queue.fal.run/fal-ai/{model_path}",
                 payload,
                 api_key,
+                request_log_path=output_path.parent / "fal_requests.jsonl",
             )
 
             video_url = data["video"]["url"]
             video_response = requests.get(video_url, timeout=120)
             video_response.raise_for_status()
 
-            output_path = Path(inputs.get("output_path", "veo_output.mp4"))
-            output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(video_response.content)
 
         except Exception as e:

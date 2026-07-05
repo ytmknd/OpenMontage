@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -674,6 +676,17 @@ def _http_error_detail(exc) -> str:
     return f"HTTP {status_code}: {body}"
 
 
+def _append_request_log(path: "str | Path", record: dict[str, Any]) -> None:
+    """Append one JSON line to the fal request log. Best-effort — never raises."""
+    try:
+        log_path = Path(path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def submit_and_poll_fal_queue(
     submit_url: str,
     payload: dict[str, Any],
@@ -682,6 +695,7 @@ def submit_and_poll_fal_queue(
     timeout: float = 900.0,
     poll_interval: float = 5.0,
     max_interval: float = 30.0,
+    request_log_path: "str | Path | None" = None,
 ) -> dict[str, Any]:
     """Submit a job to a fal.ai queue endpoint and poll it to completion.
 
@@ -697,6 +711,14 @@ def submit_and_poll_fal_queue(
     includes ``status_url`` — the job may still complete on fal's side (and
     has already been billed), so the caller/agent can poll that URL directly
     to recover the result without re-submitting and paying twice.
+
+    If ``request_log_path`` is given, every meaningful transition (submitted,
+    completed, failed/cancelled, timeout) is appended as a JSON line to that
+    path. This log is the recovery ledger for billed-but-uncollected jobs —
+    a submit is billed immediately, but if this process dies mid-poll the
+    ``request_id`` would otherwise be lost. The ``fal_queue`` tool's
+    ``collect``/``list`` operations consume this log to recover or audit
+    those jobs after the fact.
     """
     import requests
 
@@ -718,6 +740,20 @@ def submit_and_poll_fal_queue(
             f"fal queue submit response missing {e}: {repr(queue_data)[:300]}"
         ) from e
 
+    if request_log_path is not None:
+        _append_request_log(
+            request_log_path,
+            {
+                "request_id": request_id,
+                "status_url": status_url,
+                "response_url": response_url,
+                "submit_url": submit_url,
+                "prompt": str(payload.get("prompt", ""))[:200],
+                "event": "submitted",
+                "at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
     deadline = time.time() + timeout
     interval = poll_interval
     consecutive_failures = 0
@@ -726,6 +762,16 @@ def submit_and_poll_fal_queue(
     while True:
         now = time.time()
         if now >= deadline:
+            if request_log_path is not None:
+                _append_request_log(
+                    request_log_path,
+                    {
+                        "request_id": request_id,
+                        "event": "timeout",
+                        "status": last_status,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
             raise TimeoutError(
                 f"fal job {request_id} still {last_status} after {int(timeout)}s. "
                 "The job may still complete and has already been billed — poll "
@@ -764,6 +810,15 @@ def submit_and_poll_fal_queue(
                 elif entry:
                     messages.append(str(entry))
             log_tail = "; ".join(messages[-5:]) if messages else "no logs available"
+            if request_log_path is not None:
+                _append_request_log(
+                    request_log_path,
+                    {
+                        "request_id": request_id,
+                        "event": last_status.lower(),
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
             raise FalJobError(
                 f"fal job {request_id} {last_status.lower()}: {log_tail}"
             )
@@ -773,6 +828,16 @@ def submit_and_poll_fal_queue(
         result_resp.raise_for_status()
     except requests.HTTPError as e:
         raise FalJobError(f"fal queue result fetch failed: {_http_error_detail(e)}") from e
+
+    if request_log_path is not None:
+        _append_request_log(
+            request_log_path,
+            {
+                "request_id": request_id,
+                "event": "completed",
+                "at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     return result_resp.json()
 
