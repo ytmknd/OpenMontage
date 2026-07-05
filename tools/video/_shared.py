@@ -656,6 +656,127 @@ def generate_ltx_modal_video(inputs: dict[str, Any]) -> ToolResult:
     )
 
 
+class FalJobError(RuntimeError):
+    """A fal.ai queue job failed or was rejected. Message carries HTTP body / job logs."""
+
+
+def _http_error_detail(exc) -> str:
+    """Extract 'HTTP <code>: <body[:500]>' from a requests.HTTPError, best-effort."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+    status_code = getattr(response, "status_code", "?")
+    try:
+        body = response.text
+    except Exception:
+        body = ""
+    body = (body or "")[:500]
+    return f"HTTP {status_code}: {body}"
+
+
+def submit_and_poll_fal_queue(
+    submit_url: str,
+    payload: dict[str, Any],
+    api_key: str,
+    *,
+    timeout: float = 900.0,
+    poll_interval: float = 5.0,
+    max_interval: float = 30.0,
+) -> dict[str, Any]:
+    """Submit a job to a fal.ai queue endpoint and poll it to completion.
+
+    Uses a hard deadline (``timeout`` seconds) combined with exponential
+    backoff (interval grows by 1.5x each poll, capped at ``max_interval``,
+    and each sleep is further capped by the remaining time to the deadline).
+
+    FAILED/CANCELLED reasons are pulled from the ``?logs=1`` status endpoint
+    so the raised error carries the actual failure detail (e.g. moderation
+    rejection) instead of a bare status string.
+
+    If the deadline expires, the raised ``TimeoutError`` deliberately
+    includes ``status_url`` — the job may still complete on fal's side (and
+    has already been billed), so the caller/agent can poll that URL directly
+    to recover the result without re-submitting and paying twice.
+    """
+    import requests
+
+    headers = {"Authorization": f"Key {api_key}", "Content-Type": "application/json"}
+
+    try:
+        submit_resp = requests.post(submit_url, headers=headers, json=payload, timeout=30)
+        submit_resp.raise_for_status()
+    except requests.HTTPError as e:
+        raise FalJobError(f"fal queue submit rejected: {_http_error_detail(e)}") from e
+
+    queue_data = submit_resp.json()
+    try:
+        request_id = queue_data["request_id"]
+        status_url = queue_data["status_url"]
+        response_url = queue_data["response_url"]
+    except KeyError as e:
+        raise FalJobError(
+            f"fal queue submit response missing {e}: {repr(queue_data)[:300]}"
+        ) from e
+
+    deadline = time.time() + timeout
+    interval = poll_interval
+    consecutive_failures = 0
+    last_status = "UNKNOWN"
+
+    while True:
+        now = time.time()
+        if now >= deadline:
+            raise TimeoutError(
+                f"fal job {request_id} still {last_status} after {int(timeout)}s. "
+                "The job may still complete and has already been billed — poll "
+                f"{status_url} to recover the result without re-submitting."
+            )
+
+        time.sleep(min(interval, max(0.0, deadline - now)))
+        interval = min(interval * 1.5, max_interval)
+
+        try:
+            status_resp = requests.get(f"{status_url}?logs=1", headers=headers, timeout=15)
+            status_resp.raise_for_status()
+            status_json = status_resp.json()
+        except requests.RequestException as e:
+            consecutive_failures += 1
+            if consecutive_failures >= 5:
+                raise FalJobError(
+                    f"fal job {request_id} polling failed 5 times in a row: {e}"
+                ) from e
+            continue
+
+        consecutive_failures = 0
+        last_status = status_json.get("status", "UNKNOWN")
+
+        if last_status == "COMPLETED":
+            break
+
+        if last_status in ("FAILED", "CANCELLED"):
+            raw_logs = status_json.get("logs") or []
+            messages = []
+            for entry in raw_logs:
+                if isinstance(entry, dict):
+                    message = entry.get("message")
+                    if message:
+                        messages.append(str(message))
+                elif entry:
+                    messages.append(str(entry))
+            log_tail = "; ".join(messages[-5:]) if messages else "no logs available"
+            raise FalJobError(
+                f"fal job {request_id} {last_status.lower()}: {log_tail}"
+            )
+
+    try:
+        result_resp = requests.get(response_url, headers=headers, timeout=30)
+        result_resp.raise_for_status()
+    except requests.HTTPError as e:
+        raise FalJobError(f"fal queue result fetch failed: {_http_error_detail(e)}") from e
+
+    return result_resp.json()
+
+
 def probe_output(path: Path) -> dict[str, Any]:
     info: dict[str, Any] = {"file_size_bytes": path.stat().st_size}
     if not shutil.which("ffprobe"):

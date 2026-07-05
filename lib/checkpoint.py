@@ -7,6 +7,7 @@ checkpoints to resume pipelines and to present state at human checkpoints.
 from __future__ import annotations
 
 import json
+import logging
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,7 +60,6 @@ def get_pipeline_stages(pipeline_type: str | None) -> list[str]:
     """
     if pipeline_type is None:
         # Deterministic canonical fallback — sorted to ensure stable ordering
-        import logging
         logging.getLogger(__name__).warning(
             "get_pipeline_stages called without pipeline_type — "
             "using canonical fallback order. Pass pipeline_type for correctness."
@@ -70,8 +70,16 @@ def get_pipeline_stages(pipeline_type: str | None) -> list[str]:
         from lib.pipeline_loader import load_pipeline, get_stage_order
         manifest = load_pipeline(pipeline_type)
         return get_stage_order(manifest)
-    except (FileNotFoundError, Exception):
-        # Graceful fallback: return all known stages in canonical order
+    except FileNotFoundError:
+        # Graceful fallback ONLY for an unknown/missing pipeline manifest.
+        # Any other exception (YAML syntax errors, jsonschema.ValidationError,
+        # etc.) indicates a broken manifest and must propagate — silently
+        # falling back would mask real authoring errors.
+        logging.getLogger(__name__).warning(
+            "get_pipeline_stages: no manifest found for pipeline_type %r — "
+            "using canonical fallback order.",
+            pipeline_type,
+        )
         return list(STAGES)
 
 CHECKPOINT_SCHEMA_PATH = (

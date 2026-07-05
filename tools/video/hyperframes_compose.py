@@ -1140,6 +1140,12 @@ class HyperFramesCompose(BaseTool):
                 cmd,
                 capture_output=True,
                 text=True,
+                # Force UTF-8 decoding. The default uses the OS locale (cp1252 on
+                # Windows), which raises UnicodeDecodeError on a subprocess that
+                # emits Unicode/emoji output, killing the reader thread and
+                # potentially swallowing the real error text.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 cwd=str(cwd) if cwd else None,
                 check=False,

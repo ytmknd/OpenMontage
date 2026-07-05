@@ -138,45 +138,20 @@ class KlingVideo(BaseTool):
             payload["duration"] = inputs["duration"]
         if inputs.get("aspect_ratio"):
             payload["aspect_ratio"] = inputs["aspect_ratio"]
+        if "generate_audio" in inputs:
+            # fal.ai kling v3 native-audio toggle; omit for older variants
+            payload["generate_audio"] = bool(inputs["generate_audio"])
         if operation == "image_to_video" and inputs.get("image_url"):
             payload["image_url"] = inputs["image_url"]
 
-        headers = {
-            "Authorization": f"Key {api_key}",
-            "Content-Type": "application/json",
-        }
+        from tools.video._shared import submit_and_poll_fal_queue
 
         try:
-            # Submit to queue API (async) — sync endpoint times out for video gen
-            submit_resp = requests.post(
+            data = submit_and_poll_fal_queue(
                 f"https://queue.fal.run/fal-ai/{model_path}",
-                headers=headers,
-                json=payload,
-                timeout=30,
+                payload,
+                api_key,
             )
-            submit_resp.raise_for_status()
-            queue_data = submit_resp.json()
-            status_url = queue_data["status_url"]
-            response_url = queue_data["response_url"]
-
-            # Poll until complete
-            while True:
-                time.sleep(5)
-                status_resp = requests.get(status_url, headers=headers, timeout=15)
-                status_resp.raise_for_status()
-                status = status_resp.json().get("status", "UNKNOWN")
-                if status == "COMPLETED":
-                    break
-                if status in ("FAILED", "CANCELLED"):
-                    return ToolResult(
-                        success=False,
-                        error=f"Kling video generation {status.lower()}",
-                    )
-
-            # Fetch result
-            result_resp = requests.get(response_url, headers=headers, timeout=30)
-            result_resp.raise_for_status()
-            data = result_resp.json()
 
             video_url = data["video"]["url"]
             video_response = requests.get(video_url, timeout=120)

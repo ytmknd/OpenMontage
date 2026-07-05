@@ -279,47 +279,14 @@ class VeoVideo(BaseTool):
             payload["first_frame_url"] = first_frame
             payload["last_frame_url"] = last_frame
 
-        headers = {
-            "Authorization": f"Key {api_key}",
-            "Content-Type": "application/json",
-        }
+        from tools.video._shared import submit_and_poll_fal_queue
 
         try:
-            # Submit to queue API (async) — sync endpoint times out for video gen
-            submit_resp = requests.post(
+            data = submit_and_poll_fal_queue(
                 f"https://queue.fal.run/fal-ai/{model_path}",
-                headers=headers,
-                json=payload,
-                timeout=30,
+                payload,
+                api_key,
             )
-            submit_resp.raise_for_status()
-            queue_data = submit_resp.json()
-            status_url = queue_data["status_url"]
-            response_url = queue_data["response_url"]
-
-            # Poll until complete
-            while True:
-                time.sleep(5)
-                status_resp = requests.get(status_url, headers=headers, timeout=15)
-                status_resp.raise_for_status()
-                status = status_resp.json().get("status", "UNKNOWN")
-                if status == "COMPLETED":
-                    break
-                if status in ("FAILED", "CANCELLED"):
-                    return ToolResult(
-                        success=False,
-                        error=f"Veo video generation {status.lower()}",
-                    )
-
-            # Fetch result
-            result_resp = requests.get(response_url, headers=headers, timeout=30)
-            if not result_resp.ok:
-                detail = result_resp.text[:1000]
-                return ToolResult(
-                    success=False,
-                    error=f"Veo video generation result fetch failed ({result_resp.status_code}): {detail}",
-                )
-            data = result_resp.json()
 
             video_url = data["video"]["url"]
             video_response = requests.get(video_url, timeout=120)
