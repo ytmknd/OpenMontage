@@ -259,9 +259,18 @@ class TestConfig:
         assert config.budget.mode.value == "warn"
         assert config.checkpoint.policy.value == "guided"
 
+    def test_checkpoint_and_paths_use_plural_pipelines_dir(self):
+        # D-5: unify on "pipelines" (matches AGENT_GUIDE.md's documented
+        # `pipelines/<project_id>/checkpoint_<stage>.json` convention).
+        config = OpenMontageConfig()
+        assert config.checkpoint.storage_dir == "pipelines"
+        assert config.paths.pipeline_dir == "pipelines"
+
     def test_load_from_yaml(self):
         config = OpenMontageConfig.load()
         assert config.budget.total_usd == 10.0
+        assert config.checkpoint.storage_dir == "pipelines"
+        assert config.paths.pipeline_dir == "pipelines"
 
 
 # ---- Schemas ----

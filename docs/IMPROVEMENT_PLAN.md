@@ -239,12 +239,14 @@ tools/video/compose/
 
 テスト: `test_fal_queue_recovery.py`(9)+ `test_fal_clip_cache.py`(4)+ `test_pricing.py`(6)を追加。全 447 件 pass。
 
-### Phase 3 — ガバナンスの機械化と整理
+### Phase 3 — ガバナンスの機械化と整理 ✅ 実施済み (2026-07-06)
 
-9. `execute_tracked`(reserve/reconcile/retry の自動化)+ approved_tools 永続化
-10. video_compose のモジュール分割(D-1)、engine_used の可視化(D-2)
-11. dotenv 一本化(D-3)、status キャッシュ(D-4)、命名統一(D-5)
-12. scoring の予算連動重み(施策 6)
+9. ✅ `BaseTool.execute_tracked(inputs, tracker, approved=)`: estimate → reserve → execute(RetryPolicy 準拠のリトライ+バックオフ)→ reconcile を 1 呼び出しに。承認要求/予算超過は `blocked_by` 付き ToolResult で返る。`CostTracker.approved_tools` は cost_log.json に永続化、`reserve(approved=True)` で人間承認をパススルー可能に
+10. ✅ video_compose を mixin 方式で分割(本体 665 行 + `compose_engines/` 5 モジュール、全ファイル 800 行未満、挙動変更ゼロの cut-paste)。全レンダー経路に `engine_used` を付与し、remotion ロック時の FFmpeg 迂回には `engine_downgrade_reason` を明示(D-2)
+11. ✅ dotenv は `lib/env_loader.py` の手書きパーサーに一本化(python-dotenv 依存を除去、base_tool/tool_registry は委譲)。`get_status_cached(ttl=60s)` をレジストリのホットパスに適用。`pipeline` → `pipelines` 命名統一(config.yaml / config_model / .gitignore / ARCHITECTURE.md)
+12. ✅ scoring: `cost_weight` を予算残高に連動(残 $2 以上 0.10 / $0.5-2 0.25 / $0.5 未満 0.40、他重みは合計 1.0 を維持するようスケール)。予算コンテキストなしでは従来と完全同一
+
+テスト: execute_tracked(8)/env_loader(5)/status_cache(4)/scoring 予算重み(4)/engine 可視化(5)を追加。全 474 件 pass。
 
 ### テスト方針
 

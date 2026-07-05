@@ -13,11 +13,16 @@ import os
 import platform
 import subprocess
 import shutil
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+# cost_tracker only imports lib.config_model, so importing it here at module
+# scope does not create an import cycle with base_tool.
+from tools.cost_tracker import ApprovalRequiredError, BudgetExceededError, CostTracker
 
 
 def _load_dotenv() -> None:
@@ -26,33 +31,12 @@ def _load_dotenv() -> None:
     This ensures API keys are available before any tool is instantiated,
     even when tools are imported directly without going through the registry.
     Only sets variables that are not already in the environment.
+
+    Delegates to lib.env_loader.load_env(), the canonical .env parser.
     """
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if not env_path.is_file():
-        return
-    import re
-    with open(env_path, encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip()
-            # Quoted value: take the content inside the quotes verbatim.
-            if value[:1] in ("'", '"'):
-                quote = value[0]
-                end = value.find(quote, 1)
-                value = value[1:end] if end != -1 else value[1:]
-            else:
-                # Strip an inline comment ('#' at line start or after
-                # whitespace) so "VAR=   # note" yields "" not "# note".
-                match = re.search(r"(^|\s)#", value)
-                if match:
-                    value = value[: match.start()]
-                value = value.strip()
-            if key and key not in os.environ:
-                os.environ[key] = value
+    from lib.env_loader import load_env
+
+    load_env()
 
 
 _load_dotenv()
@@ -206,6 +190,21 @@ class BaseTool(ABC):
         except DependencyError:
             return ToolStatus.UNAVAILABLE
 
+    def get_status_cached(self, ttl_seconds: float = 60.0) -> ToolStatus:
+        """get_status() with a per-instance TTL cache. Env/config changes within
+        the TTL window are not seen — call get_status() directly when freshness
+        matters more than speed.
+        """
+        cached = getattr(self, "_status_cache", None)
+        now = time.monotonic()
+        if cached is not None:
+            status, cached_at = cached
+            if now - cached_at < ttl_seconds:
+                return status
+        status = self.get_status()
+        self._status_cache = (status, now)
+        return status
+
     def check_dependencies(self) -> None:
         """Verify all dependencies are installed. Raises DependencyError if not."""
         for dep in self.dependencies:
@@ -299,6 +298,94 @@ class BaseTool(ABC):
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         """Run the tool. Subclasses must implement this."""
         ...
+
+    def execute_tracked(
+        self,
+        inputs: dict[str, Any],
+        tracker: CostTracker,
+        *,
+        operation: Optional[str] = None,
+        approved: bool = False,
+    ) -> ToolResult:
+        """Run execute() under budget governance: estimate -> reserve -> execute
+        (with retry per retry_policy) -> reconcile. Paid tools should be invoked
+        through this wrapper so cost_log.json reflects reality.
+        """
+        estimated = self.estimate_cost(inputs)
+        entry_id = tracker.estimate(
+            self.name, operation or str(inputs.get("operation", "execute")), estimated
+        )
+
+        try:
+            tracker.reserve(entry_id, approved=approved)
+        except ApprovalRequiredError as exc:
+            return ToolResult(
+                success=False,
+                error=str(exc),
+                data={
+                    "blocked_by": "approval_required",
+                    "cost_entry_id": entry_id,
+                    "estimated_usd": estimated,
+                    "tool": self.name,
+                },
+            )
+        except BudgetExceededError as exc:
+            return ToolResult(
+                success=False,
+                error=str(exc),
+                data={
+                    "blocked_by": "budget_exceeded",
+                    "cost_entry_id": entry_id,
+                    "estimated_usd": estimated,
+                    "tool": self.name,
+                },
+            )
+
+        attempts_allowed = 1 + max(0, self.retry_policy.max_retries)
+        result: Optional[ToolResult] = None
+        attempts = 0
+        for attempt_index in range(attempts_allowed):
+            attempts += 1
+            try:
+                result = self.execute(inputs)
+            except Exception as exc:  # noqa: BLE001 - convert any tool failure
+                result = ToolResult(success=False, error=str(exc))
+
+            if result.success:
+                break
+
+            attempts_remaining = attempts_allowed - attempts
+            if attempts_remaining > 0 and self._is_retryable_error(result.error):
+                time.sleep(self.retry_policy.backoff_seconds * (2 ** attempt_index))
+                continue
+            break
+
+        tracker.reconcile(entry_id, result.cost_usd or 0.0, success=result.success)
+
+        if result.data is None:
+            result.data = {}
+        result.data["cost_entry_id"] = entry_id
+        result.data["estimated_usd"] = estimated
+        result.data["attempts"] = attempts
+        result.data["cost_tracked"] = True
+        return result
+
+    def _is_retryable_error(self, error: Optional[str]) -> bool:
+        """Whether ``error`` matches one of this tool's declared retryable tokens."""
+        if not error or not self.retry_policy.retryable_errors:
+            return False
+        lowered = error.lower()
+        for token in self.retry_policy.retryable_errors:
+            token_lower = token.lower()
+            if token_lower == "rate_limit":
+                if "rate limit" in lowered or "rate_limit" in lowered or "429" in lowered:
+                    return True
+            elif token_lower == "timeout":
+                if "timeout" in lowered or "timed out" in lowered:
+                    return True
+            elif token_lower in lowered:
+                return True
+        return False
 
     def dry_run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Preflight check without side effects. Override for paid/publishing tools."""

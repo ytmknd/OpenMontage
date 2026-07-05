@@ -9,7 +9,7 @@ Scores are normalized 0-1. Higher is better.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, replace
 import re
 from typing import Any
 
@@ -32,41 +32,68 @@ class ProviderScore:
     latency: float = 0.0        # 0-1: acceptable turnaround
     continuity: float = 0.0     # 0-1: fits already locked decisions
 
+    # Effective weight applied to cost_efficiency. Defaults to the historical
+    # fixed weight (0.10). rank_providers() raises this via dataclasses.replace()
+    # under budget pressure (see _cost_weight_for_budget) so cheap providers are
+    # more competitive once the budget is nearly exhausted. All other weights
+    # below are scaled by (1.0 - cost_weight) / 0.90 so the total still sums to
+    # 1.0. At the default 0.10 the scale factor is 1.0 — identical to today.
+    cost_weight: float = 0.10
+
+    @property
+    def _weights(self) -> dict[str, float]:
+        """Effective per-dimension weights, scaled for the current cost_weight."""
+        scale = (1.0 - self.cost_weight) / 0.90
+        return {
+            "task_fit": 0.30 * scale,
+            "output_quality": 0.20 * scale,
+            "control": 0.15 * scale,
+            "reliability": 0.15 * scale,
+            "cost_efficiency": self.cost_weight,
+            "latency": 0.05 * scale,
+            "continuity": 0.05 * scale,
+        }
+
     @property
     def weighted_score(self) -> float:
+        w = self._weights
         return (
-            self.task_fit * 0.30
-            + self.output_quality * 0.20
-            + self.control * 0.15
-            + self.reliability * 0.15
-            + self.cost_efficiency * 0.10
-            + self.latency * 0.05
-            + self.continuity * 0.05
+            self.task_fit * w["task_fit"]
+            + self.output_quality * w["output_quality"]
+            + self.control * w["control"]
+            + self.reliability * w["reliability"]
+            + self.cost_efficiency * w["cost_efficiency"]
+            + self.latency * w["latency"]
+            + self.continuity * w["continuity"]
         )
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["weighted_score"] = self.weighted_score
+        d["effective_weights"] = self._weights
         return d
 
     def explain(self) -> str:
         """Human-readable explanation of this score."""
+        w = self._weights
         parts = [f"{self.tool_name} ({self.provider}): {self.weighted_score:.2f}"]
+        if self.cost_weight != 0.10:
+            parts.append(f"  (budget-pressure cost_weight={self.cost_weight:.2f})")
         top = sorted(
             [
-                ("task_fit", self.task_fit, 0.30),
-                ("output_quality", self.output_quality, 0.20),
-                ("control", self.control, 0.15),
-                ("reliability", self.reliability, 0.15),
-                ("cost_efficiency", self.cost_efficiency, 0.10),
-                ("latency", self.latency, 0.05),
-                ("continuity", self.continuity, 0.05),
+                ("task_fit", self.task_fit, w["task_fit"]),
+                ("output_quality", self.output_quality, w["output_quality"]),
+                ("control", self.control, w["control"]),
+                ("reliability", self.reliability, w["reliability"]),
+                ("cost_efficiency", self.cost_efficiency, w["cost_efficiency"]),
+                ("latency", self.latency, w["latency"]),
+                ("continuity", self.continuity, w["continuity"]),
             ],
             key=lambda x: x[1] * x[2],
             reverse=True,
         )
         for name, val, weight in top[:3]:
-            parts.append(f"  {name}={val:.2f} (w={weight})")
+            parts.append(f"  {name}={val:.2f} (w={weight:.3f})")
         return "\n".join(parts)
 
 
@@ -530,15 +557,43 @@ def score_provider(tool, task_context: dict[str, Any]) -> ProviderScore:
     )
 
 
+def _cost_weight_for_budget(budget_remaining_usd: float | None) -> float:
+    """Budget-pressure-adaptive weight for cost_efficiency.
+
+    No budget context (None/absent) returns the historical default (0.10),
+    so scoring is byte-for-byte identical to the pre-budget-aware behavior.
+    As remaining budget shrinks, cost_efficiency counts for more so cheap
+    providers become competitive before the budget is fully exhausted.
+    """
+    if budget_remaining_usd is None:
+        return 0.10
+    if budget_remaining_usd < 0.5:
+        return 0.40
+    if budget_remaining_usd < 2.0:
+        return 0.25
+    return 0.10
+
+
 def rank_providers(
     tools: list,
     task_context: dict[str, Any],
 ) -> list[ProviderScore]:
     """Rank a list of tools by weighted score for a given task context.
 
-    Returns scores sorted best-first.
+    Returns scores sorted best-first. When task_context carries a
+    budget_remaining_usd, the cost_efficiency weight is scaled up as budget
+    pressure increases (see _cost_weight_for_budget) — without it, ranking is
+    unchanged from the fixed-weight model.
     """
-    scores = [score_provider(t, task_context) for t in tools]
+    normalized = normalize_task_context(task_context)
+    cost_weight = _cost_weight_for_budget(normalized.get("budget_remaining_usd"))
+
+    scores = []
+    for tool in tools:
+        score = score_provider(tool, task_context)
+        if cost_weight != score.cost_weight:
+            score = replace(score, cost_weight=cost_weight)
+        scores.append(score)
     return sorted(scores, key=lambda s: s.weighted_score, reverse=True)
 
 

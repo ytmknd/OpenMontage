@@ -114,30 +114,42 @@ class CostTracker:
         self._save()
         return entry_id
 
-    def reserve(self, entry_id: str) -> None:
+    def reserve(self, entry_id: str, approved: bool = False) -> None:
         """Reserve budget for an estimated entry.
 
         Raises BudgetExceededError in cap mode, or ApprovalRequiredError
         when the action exceeds the single-action approval threshold.
+
+        ``approved`` is the explicit human-approval pass-through: today there
+        is NO way to proceed past the single-action threshold (or the new
+        paid-tool gate) even after a human has said yes to it — the agent has
+        no parameter to signal "the human already approved this." When the
+        caller has obtained that approval out of band (e.g. a checkpoint the
+        human confirmed), it passes ``approved=True`` here and both the
+        single-action-threshold check and the new-paid-tool check are
+        skipped. The budget cap check still applies unconditionally —
+        approval authorizes spending the estimated amount, not exceeding the
+        budget.
         """
         entry = self._find(entry_id)
         estimated = entry["estimated_usd"]
 
-        # Check single-action approval threshold
-        if estimated > self.single_action_approval_usd:
-            if self.mode != BudgetMode.OBSERVE:
-                raise ApprovalRequiredError(
-                    f"Action costs ${estimated:.2f}, exceeds "
-                    f"single-action threshold ${self.single_action_approval_usd:.2f}"
-                )
-
-        # Check new paid tool approval
-        if self.require_approval_for_new_paid_tool and estimated > 0:
-            if entry["tool"] not in self._approved_tools:
+        if not approved:
+            # Check single-action approval threshold
+            if estimated > self.single_action_approval_usd:
                 if self.mode != BudgetMode.OBSERVE:
                     raise ApprovalRequiredError(
-                        f"First paid use of tool {entry['tool']!r} requires approval"
+                        f"Action costs ${estimated:.2f}, exceeds "
+                        f"single-action threshold ${self.single_action_approval_usd:.2f}"
                     )
+
+            # Check new paid tool approval
+            if self.require_approval_for_new_paid_tool and estimated > 0:
+                if entry["tool"] not in self._approved_tools:
+                    if self.mode != BudgetMode.OBSERVE:
+                        raise ApprovalRequiredError(
+                            f"First paid use of tool {entry['tool']!r} requires approval"
+                        )
 
         # Check budget
         if estimated > self.usable_budget_usd:
@@ -155,6 +167,7 @@ class CostTracker:
     def approve_tool(self, tool: str) -> None:
         """Mark a tool as approved for paid operations."""
         self._approved_tools.add(tool)
+        self._save()
 
     def reconcile(self, entry_id: str, actual_usd: float, success: bool = True) -> None:
         """Reconcile actual spend after tool execution."""
@@ -488,6 +501,7 @@ class CostTracker:
             "budget_reserved_usd": round(self.budget_reserved_usd, 4),
             "budget_spent_usd": round(self.budget_spent_usd, 4),
             "entries": self.entries,
+            "approved_tools": sorted(self._approved_tools),
         }
         self.cost_log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.cost_log_path, "w") as f:
@@ -498,6 +512,7 @@ class CostTracker:
             data = json.load(f)
         self.entries = data.get("entries", [])
         self.budget_total_usd = data.get("budget_total_usd", self.budget_total_usd)
+        self._approved_tools = set(data.get("approved_tools", []))
 
     # ---- Helpers ----
 

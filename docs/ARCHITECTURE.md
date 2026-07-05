@@ -358,7 +358,7 @@ budget:
 
 checkpoint:
   policy: guided
-  storage_dir: pipeline
+  storage_dir: pipelines
 
 output:
   default_format: mp4
@@ -369,7 +369,7 @@ output:
   default_crf: 23
 
 paths:
-  pipeline_dir: pipeline
+  pipeline_dir: pipelines
   library_dir: library
   styles_dir: styles
   skills_dir: skills
