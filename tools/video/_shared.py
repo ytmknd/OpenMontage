@@ -842,6 +842,53 @@ def submit_and_poll_fal_queue(
     return result_resp.json()
 
 
+def clip_cache_enabled() -> bool:
+    """Clip caching for generation tools. Disable with OPENMONTAGE_CLIP_CACHE=0/false/off."""
+    return os.environ.get("OPENMONTAGE_CLIP_CACHE", "1").lower() not in {"0", "false", "off"}
+
+
+def fal_cache_lookup(tool, inputs: dict[str, Any], output_path: Path) -> bool:
+    """Return True and materialize the cached clip at output_path on a hit.
+
+    ``force_regenerate`` bypasses the lookup only — a fresh generation still
+    gets stored via ``fal_cache_store`` afterward. Cache trouble (missing
+    dependency, filesystem drift, lock timeout) must never block generation,
+    so any exception here is swallowed and treated as a miss.
+    """
+    if not clip_cache_enabled() or inputs.get("force_regenerate"):
+        return False
+
+    clip_id = f"{tool.name}_{tool.idempotency_key(inputs)}"
+    try:
+        from tools.video.clip_cache import get_default_cache
+
+        return get_default_cache().try_link(clip_id, output_path)
+    except Exception:
+        return False
+
+
+def fal_cache_store(tool, inputs: dict[str, Any], output_path: Path, video_url: str = "") -> None:
+    """Best-effort ingest of a freshly generated clip. Never raises."""
+    if not clip_cache_enabled():
+        return
+
+    clip_id = f"{tool.name}_{tool.idempotency_key(inputs)}"
+    try:
+        from tools.video.clip_cache import get_default_cache
+
+        get_default_cache().ingest(
+            clip_id,
+            output_path,
+            metadata={
+                "source": tool.name,
+                "source_id": tool.idempotency_key(inputs),
+                "source_url": video_url,
+            },
+        )
+    except Exception:
+        pass
+
+
 def probe_output(path: Path) -> dict[str, Any]:
     info: dict[str, Any] = {"file_size_bytes": path.stat().st_size}
     if not shutil.which("ffprobe"):

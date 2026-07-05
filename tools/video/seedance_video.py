@@ -146,6 +146,11 @@ class SeedanceVideo(BaseTool):
                 "description": "Optional seed for reproducibility",
             },
             "output_path": {"type": "string"},
+            "force_regenerate": {
+                "type": "boolean",
+                "default": False,
+                "description": "Bypass the local clip cache and re-generate (re-bills the provider).",
+            },
         },
     }
 
@@ -153,7 +158,23 @@ class SeedanceVideo(BaseTool):
         cpu_cores=1, ram_mb=512, vram_mb=0, disk_mb=500, network_required=True
     )
     retry_policy = RetryPolicy(max_retries=2, retryable_errors=["rate_limit", "timeout"])
-    idempotency_key_fields = ["prompt", "model_variant", "operation", "duration", "seed"]
+    idempotency_key_fields = [
+        "aspect_ratio",
+        "duration",
+        "end_image_url",
+        "generate_audio",
+        "image_path",
+        "image_url",
+        "model_variant",
+        "operation",
+        "prompt",
+        "reference_audio_urls",
+        "reference_image_paths",
+        "reference_image_urls",
+        "reference_video_urls",
+        "resolution",
+        "seed",
+    ]
     side_effects = ["writes video file to output_path", "calls fal.ai API"]
     user_visible_verification = [
         "Watch generated clip for motion coherence, audio sync, and visual quality"
@@ -167,11 +188,29 @@ class SeedanceVideo(BaseTool):
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
 
+    # Fallback per-second rates (USD) used when pricing.yaml is missing,
+    # malformed, or lacks a "seedance_video" entry. Keep in sync with
+    # pricing.yaml's tools.seedance_video.rates.
+    _FALLBACK_RATES = {"fast": 0.2419, "standard": 0.3034}
+
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
         variant = inputs.get("model_variant", "standard")
         duration = inputs.get("duration", "5")
         secs = 5 if duration == "auto" else int(duration)
-        rate = 0.2419 if variant == "fast" else 0.3034
+        tier = "fast" if variant == "fast" else "standard"
+
+        rate = None
+        try:
+            from lib.pricing import get_tool_pricing
+
+            pricing = get_tool_pricing(self.name)
+            if pricing:
+                rate = (pricing.get("rates") or {}).get(tier)
+        except Exception:
+            rate = None
+        if rate is None:
+            rate = self._FALLBACK_RATES[tier]
+
         return round(rate * secs, 2)
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
@@ -255,6 +294,33 @@ class SeedanceVideo(BaseTool):
         output_path = Path(inputs.get("output_path", "seedance_output.mp4"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        from tools.video._shared import fal_cache_lookup, fal_cache_store
+
+        if fal_cache_lookup(self, inputs, output_path):
+            from tools.video._shared import probe_output
+
+            return ToolResult(
+                success=True,
+                data={
+                    "provider": "seedance",
+                    "model": model_path,
+                    "prompt": inputs["prompt"],
+                    "operation": operation,
+                    "variant": variant,
+                    "aspect_ratio": inputs.get("aspect_ratio", "16:9"),
+                    "resolution": inputs.get("resolution", "720p"),
+                    "generate_audio": inputs.get("generate_audio", True),
+                    "output": str(output_path),
+                    "output_path": str(output_path),
+                    "format": "mp4",
+                    "cache_hit": True,
+                    **probe_output(output_path),
+                },
+                artifacts=[str(output_path)],
+                cost_usd=0.0,
+                model=model_path,
+            )
+
         try:
             data = submit_and_poll_fal_queue(
                 f"https://queue.fal.run/{model_path}",
@@ -268,6 +334,7 @@ class SeedanceVideo(BaseTool):
             video_response.raise_for_status()
 
             output_path.write_bytes(video_response.content)
+            fal_cache_store(self, inputs, output_path, video_url=video_url)
 
         except Exception as e:
             return ToolResult(

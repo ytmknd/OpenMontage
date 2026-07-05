@@ -100,6 +100,11 @@ class GrokVideoFal(BaseTool):
                 "description": "Local reference image paths for reference_to_video (auto-uploaded to fal storage)",
             },
             "output_path": {"type": "string"},
+            "force_regenerate": {
+                "type": "boolean",
+                "default": False,
+                "description": "Bypass the local clip cache and re-generate (re-bills the provider).",
+            },
         },
     }
 
@@ -107,11 +112,24 @@ class GrokVideoFal(BaseTool):
         cpu_cores=1, ram_mb=512, vram_mb=0, disk_mb=500, network_required=True
     )
     retry_policy = RetryPolicy(max_retries=2, retryable_errors=["rate_limit", "timeout"])
-    idempotency_key_fields = ["prompt", "operation", "duration", "aspect_ratio", "resolution"]
+    idempotency_key_fields = [
+        "aspect_ratio",
+        "duration",
+        "image_path",
+        "image_url",
+        "operation",
+        "prompt",
+        "reference_image_paths",
+        "reference_image_urls",
+        "resolution",
+    ]
     side_effects = ["writes video file to output_path", "calls fal.ai API"]
     user_visible_verification = ["Watch generated clip for motion coherence and visual quality"]
 
-    _RATE_PER_SECOND = {"480p": 0.05, "720p": 0.07}
+    # Fallback per-second rates (USD) used when pricing.yaml is missing,
+    # malformed, or lacks a "grok_video_fal" entry. Keep in sync with
+    # pricing.yaml's tools.grok_video_fal.rates.
+    _FALLBACK_RATES = {"480p": 0.05, "720p": 0.07}
 
     def _get_api_key(self) -> str | None:
         return os.environ.get("FAL_KEY") or os.environ.get("FAL_AI_API_KEY")
@@ -124,7 +142,19 @@ class GrokVideoFal(BaseTool):
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
         duration = int(inputs.get("duration", 6))
         resolution = inputs.get("resolution", "720p")
-        rate = self._RATE_PER_SECOND.get(resolution, 0.07)
+
+        rate = None
+        try:
+            from lib.pricing import get_tool_pricing
+
+            pricing = get_tool_pricing(self.name)
+            if pricing:
+                rate = (pricing.get("rates") or {}).get(resolution)
+        except Exception:
+            rate = None
+        if rate is None:
+            rate = self._FALLBACK_RATES.get(resolution, 0.07)
+
         return round(rate * duration, 4)
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
@@ -182,6 +212,31 @@ class GrokVideoFal(BaseTool):
         output_path = Path(inputs.get("output_path", "grok_fal_output.mp4"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        from tools.video._shared import fal_cache_lookup, fal_cache_store
+
+        if fal_cache_lookup(self, inputs, output_path):
+            from tools.video._shared import probe_output
+
+            return ToolResult(
+                success=True,
+                data={
+                    "provider": "grok",
+                    "model": model_path,
+                    "prompt": inputs["prompt"],
+                    "operation": operation,
+                    "aspect_ratio": inputs.get("aspect_ratio", "16:9"),
+                    "resolution": inputs.get("resolution", "720p"),
+                    "output": str(output_path),
+                    "output_path": str(output_path),
+                    "format": "mp4",
+                    "cache_hit": True,
+                    **probe_output(output_path),
+                },
+                artifacts=[str(output_path)],
+                cost_usd=0.0,
+                model=model_path,
+            )
+
         try:
             data = submit_and_poll_fal_queue(
                 f"https://queue.fal.run/{model_path}",
@@ -195,6 +250,7 @@ class GrokVideoFal(BaseTool):
             video_response.raise_for_status()
 
             output_path.write_bytes(video_response.content)
+            fal_cache_store(self, inputs, output_path, video_url=video_url)
 
         except Exception as e:
             return ToolResult(success=False, error=f"Grok video generation failed: {e}")

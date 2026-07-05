@@ -83,8 +83,17 @@ class KlingVideo(BaseTool):
                 "enum": ["16:9", "9:16", "1:1"],
                 "default": "16:9",
             },
+            "generate_audio": {
+                "type": "boolean",
+                "description": "Kling v3 native-audio toggle (v3 variants only).",
+            },
             "image_url": {"type": "string", "description": "Reference image URL for image_to_video"},
             "output_path": {"type": "string"},
+            "force_regenerate": {
+                "type": "boolean",
+                "default": False,
+                "description": "Bypass the local clip cache and re-generate (re-bills the provider).",
+            },
         },
     }
 
@@ -92,7 +101,15 @@ class KlingVideo(BaseTool):
         cpu_cores=1, ram_mb=512, vram_mb=0, disk_mb=500, network_required=True
     )
     retry_policy = RetryPolicy(max_retries=2, retryable_errors=["rate_limit", "timeout"])
-    idempotency_key_fields = ["prompt", "model_variant", "operation", "duration"]
+    idempotency_key_fields = [
+        "aspect_ratio",
+        "duration",
+        "generate_audio",
+        "image_url",
+        "model_variant",
+        "operation",
+        "prompt",
+    ]
     side_effects = ["writes video file to output_path", "calls fal.ai API"]
     user_visible_verification = ["Watch generated clip for motion coherence and visual quality"]
 
@@ -104,14 +121,35 @@ class KlingVideo(BaseTool):
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
 
+    # Fallback rates (USD per 5-second clip, by variant tier) used when
+    # pricing.yaml is missing, malformed, or lacks a "kling_video" entry.
+    # Keep these in sync with pricing.yaml's tools.kling_video.rates —
+    # this dict is what estimate_cost() returned before pricing.yaml existed.
+    _FALLBACK_RATES = {"master": 0.30, "pro": 0.20, "standard": 0.10}
+
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
         variant = inputs.get("model_variant", "v3/standard")
         duration = int(inputs.get("duration", "5"))
         if "master" in variant:
-            return 0.30 * (duration / 5)
-        if "pro" in variant:
-            return 0.20 * (duration / 5)
-        return 0.10 * (duration / 5)  # standard
+            tier = "master"
+        elif "pro" in variant:
+            tier = "pro"
+        else:
+            tier = "standard"
+
+        rate = None
+        try:
+            from lib.pricing import get_tool_pricing
+
+            pricing = get_tool_pricing(self.name)
+            if pricing:
+                rate = (pricing.get("rates") or {}).get(tier)
+        except Exception:
+            rate = None
+        if rate is None:
+            rate = self._FALLBACK_RATES[tier]
+
+        return rate * (duration / 5)
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
         return 60.0  # ~1 minute typical
@@ -149,6 +187,30 @@ class KlingVideo(BaseTool):
         output_path = Path(inputs.get("output_path", "kling_output.mp4"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        from tools.video._shared import fal_cache_lookup, fal_cache_store
+
+        if fal_cache_lookup(self, inputs, output_path):
+            from tools.video._shared import probe_output
+
+            return ToolResult(
+                success=True,
+                data={
+                    "provider": "kling",
+                    "model": f"fal-ai/{model_path}",
+                    "prompt": inputs["prompt"],
+                    "operation": operation,
+                    "aspect_ratio": inputs.get("aspect_ratio", "16:9"),
+                    "output": str(output_path),
+                    "output_path": str(output_path),
+                    "format": "mp4",
+                    "cache_hit": True,
+                    **probe_output(output_path),
+                },
+                artifacts=[str(output_path)],
+                cost_usd=0.0,
+                model=f"fal-ai/{model_path}",
+            )
+
         try:
             data = submit_and_poll_fal_queue(
                 f"https://queue.fal.run/fal-ai/{model_path}",
@@ -162,6 +224,7 @@ class KlingVideo(BaseTool):
             video_response.raise_for_status()
 
             output_path.write_bytes(video_response.content)
+            fal_cache_store(self, inputs, output_path, video_url=video_url)
 
         except Exception as e:
             return ToolResult(success=False, error=f"Kling video generation failed: {e}")

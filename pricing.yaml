@@ -1,0 +1,45 @@
+# fal.ai provider pricing used by estimate_cost(). Update as_of when refreshing.
+#
+# Each tool's estimate_cost() reads `tools.<tool_name>.rates` and falls back
+# to its own hardcoded `_FALLBACK_RATES` constant when this file is missing,
+# malformed, or lacks the needed key -- so deleting this file never changes
+# cost-estimation behavior, only removes the ability to update rates without
+# a code change.
+as_of: "2026-07-05"
+
+tools:
+  kling_video:
+    unit: per_5_seconds
+    rates:
+      master: 0.30
+      pro: 0.20
+      standard: 0.10
+
+  minimax_video:
+    unit: flat_per_clip
+    rates:
+      pro: 0.15
+      fast: 0.08
+      standard: 0.10
+
+  veo_video:
+    unit: per_second
+    rates:
+      fast_base: 0.10
+      fast_audio: 0.20
+      standard_base: 0.20
+      standard_audio: 0.40
+      standard_4k_base: 0.40
+      standard_4k_audio: 0.60
+
+  seedance_video:
+    unit: per_second
+    rates:
+      fast: 0.2419
+      standard: 0.3034
+
+  grok_video_fal:
+    unit: per_second
+    rates:
+      "480p": 0.05
+      "720p": 0.07

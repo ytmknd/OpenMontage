@@ -125,6 +125,11 @@ class VeoVideo(BaseTool):
             "last_frame_url": {"type": "string"},
             "last_frame_path": {"type": "string"},
             "output_path": {"type": "string"},
+            "force_regenerate": {
+                "type": "boolean",
+                "default": False,
+                "description": "Bypass the local clip cache and re-generate (re-bills the provider).",
+            },
         },
     }
 
@@ -132,7 +137,27 @@ class VeoVideo(BaseTool):
         cpu_cores=1, ram_mb=512, vram_mb=0, disk_mb=500, network_required=True
     )
     retry_policy = RetryPolicy(max_retries=2, retryable_errors=["rate_limit", "timeout"])
-    idempotency_key_fields = ["prompt", "model_variant", "operation", "duration"]
+    idempotency_key_fields = [
+        "aspect_ratio",
+        "auto_fix",
+        "duration",
+        "first_frame_path",
+        "first_frame_url",
+        "generate_audio",
+        "image_path",
+        "image_url",
+        "last_frame_path",
+        "last_frame_url",
+        "model_variant",
+        "negative_prompt",
+        "operation",
+        "prompt",
+        "reference_image_paths",
+        "reference_image_urls",
+        "resolution",
+        "safety_tolerance",
+        "seed",
+    ]
     side_effects = ["writes video file to output_path", "calls fal.ai API"]
     user_visible_verification = [
         "Watch generated clip for visual quality and motion",
@@ -147,6 +172,18 @@ class VeoVideo(BaseTool):
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
 
+    # Fallback per-second rates (USD) used when pricing.yaml is missing,
+    # malformed, or lacks a "veo_video" entry. Keep in sync with
+    # pricing.yaml's tools.veo_video.rates.
+    _FALLBACK_RATES = {
+        "fast_base": 0.10,
+        "fast_audio": 0.20,
+        "standard_base": 0.20,
+        "standard_audio": 0.40,
+        "standard_4k_base": 0.40,
+        "standard_4k_audio": 0.60,
+    }
+
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
         variant = inputs.get("model_variant", "veo3.1")
         duration_text = str(inputs.get("duration", "8s")).replace("s", "")
@@ -155,17 +192,26 @@ class VeoVideo(BaseTool):
         generate_audio = bool(inputs.get("generate_audio", True))
 
         if "fast" in variant:
-            base_per_second = 0.10
-            audio_per_second = 0.20
+            base_key, audio_key = "fast_base", "fast_audio"
+        elif resolution == "4k":
+            base_key, audio_key = "standard_4k_base", "standard_4k_audio"
         else:
-            if resolution == "4k":
-                base_per_second = 0.40
-                audio_per_second = 0.60
-            else:
-                base_per_second = 0.20
-                audio_per_second = 0.40
+            base_key, audio_key = "standard_base", "standard_audio"
+        rate_key = audio_key if generate_audio else base_key
 
-        return (audio_per_second if generate_audio else base_per_second) * duration
+        rate = None
+        try:
+            from lib.pricing import get_tool_pricing
+
+            pricing = get_tool_pricing(self.name)
+            if pricing:
+                rate = (pricing.get("rates") or {}).get(rate_key)
+        except Exception:
+            rate = None
+        if rate is None:
+            rate = self._FALLBACK_RATES[rate_key]
+
+        return rate * duration
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
         variant = inputs.get("model_variant", "veo3.1")
@@ -284,6 +330,30 @@ class VeoVideo(BaseTool):
         output_path = Path(inputs.get("output_path", "veo_output.mp4"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        from tools.video._shared import fal_cache_lookup, fal_cache_store
+
+        if fal_cache_lookup(self, inputs, output_path):
+            from tools.video._shared import probe_output
+
+            return ToolResult(
+                success=True,
+                data={
+                    "provider": "veo",
+                    "model": f"fal-ai/{model_path}",
+                    "prompt": inputs["prompt"],
+                    "output": str(output_path),
+                    "output_path": str(output_path),
+                    "format": "mp4",
+                    "has_audio": inputs.get("generate_audio", True),
+                    "operation": operation,
+                    "cache_hit": True,
+                    **probe_output(output_path),
+                },
+                artifacts=[str(output_path)],
+                cost_usd=0.0,
+                model=f"fal-ai/{model_path}",
+            )
+
         try:
             data = submit_and_poll_fal_queue(
                 f"https://queue.fal.run/fal-ai/{model_path}",
@@ -297,6 +367,7 @@ class VeoVideo(BaseTool):
             video_response.raise_for_status()
 
             output_path.write_bytes(video_response.content)
+            fal_cache_store(self, inputs, output_path, video_url=video_url)
 
         except Exception as e:
             return ToolResult(success=False, error=f"Veo video generation failed: {e}")

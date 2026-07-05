@@ -230,12 +230,14 @@ tools/video/compose/
 
 テスト: `tests/tools/test_fal_queue_helper.py`(4 ケース)+ `tests/tools/test_checkpoint_stage_fallback.py`(2 ケース)を追加。`tests/tools` + `tests/contracts` 全 428 件 pass を確認。
 
-### Phase 2 — fal 共通基盤(コスト最適化の本丸)
+### Phase 2 — fal 共通基盤(コスト最適化の本丸) ✅ 実施済み (2026-07-06)
 
-5. `_fal_queue.py` 共通クライアント(submit / poll / collect / logs / request_id 永続化)
-6. clip_cache 接続(idempotency_key ベース)
-7. pricing.yaml 外出し
-8. 5 ツールを共通クライアントへ移行(1 ツールずつ、契約テストを先に書く)
+5. ✅ request_id 永続化: `submit_and_poll_fal_queue(request_log_path=...)` が submitted / completed / failed / cancelled / timeout を `fal_requests.jsonl`(出力先と同じディレクトリ)へ JSONL 追記。新設の `fal_queue` ツール(capability=job_recovery)の `status` / `collect` / `list` 操作で、課金済み未回収ジョブを再課金なしで回収・監査できる
+6. ✅ clip_cache 接続: `fal_cache_lookup` / `fal_cache_store`(`_shared.py`)を 5 ツール全部に配線。clip_id は `{tool_name}_{idempotency_key}`。同一入力の再実行はキャッシュヒット(`cache_hit: true`, `cost_usd: 0.0`)。`force_regenerate: true` でバイパス、`OPENMONTAGE_CLIP_CACHE=0` で無効化。併せて 5 ツールの `idempotency_key_fields` を全生成関連入力に是正(kling は未宣言だった `generate_audio` もスキーマ宣言+キー追加)
+7. ✅ pricing.yaml 外出し: リポジトリ直下 `pricing.yaml`(`as_of` 付き)+ `lib/pricing.py`。yaml 欠損時は各ツールの `_FALLBACK_RATES` に完全フォールバック(挙動不変)。`provider_menu_summary()` が 90 日超の価格鮮度警告を runtime_warnings に出す
+8. ✅ 共通クライアント移行は Phase 1 で完了済み
+
+テスト: `test_fal_queue_recovery.py`(9)+ `test_fal_clip_cache.py`(4)+ `test_pricing.py`(6)を追加。全 447 件 pass。
 
 ### Phase 3 — ガバナンスの機械化と整理
 

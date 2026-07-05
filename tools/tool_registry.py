@@ -456,6 +456,15 @@ class ToolRegistry:
                         f"{entry.get('name')}: {entry.get('resource_profile_note')}"
                     )
 
+        try:
+            from lib.pricing import staleness_warning
+
+            warning = staleness_warning()
+            if warning:
+                runtime_warnings.append(warning)
+        except Exception:
+            pass
+
         result = {
             "composition_runtimes": comp_runtimes,
             "capabilities": capabilities,
